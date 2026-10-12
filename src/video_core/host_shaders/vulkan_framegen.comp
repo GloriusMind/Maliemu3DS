@@ -1,0 +1,76 @@
+// Copyright 2024-2026 Maliemu3DS Project
+// Licensed under GPLv2 or any later version
+// FrameGen: Temporal Motion-Compensated Frame Generation Shader for ARM Mali GPUs
+#version 450 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D prev_frame;
+layout(binding = 1) uniform sampler2D curr_frame;
+layout(binding = 2, rgba8) uniform writeonly image2D out_interpolated_frame;
+
+layout(push_constant, std140) uniform FrameGenConfig {
+    vec2 resolution;
+    float blend_weight;      // 0.5 default for halfway interpolation
+    float motion_threshold;  // 0.08 threshold for motion edge preservation
+    int cadence_mode;        // 0: linear temporal, 1: optical flow motion-compensated, 2: low latency
+    float sharpness;         // 0.20 Mali Valhall/Bifrost Contrast-Adaptive Sharpening
+};
+
+float Luminance(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+    ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel_coord.x >= int(resolution.x) || pixel_coord.y >= int(resolution.y)) {
+        return;
+    }
+
+    vec2 uv = (vec2(pixel_coord) + 0.5) / resolution;
+    vec2 texel_size = 1.0 / resolution;
+
+    vec4 prev_sample = texture(prev_frame, uv);
+    vec4 curr_sample = texture(curr_frame, uv);
+
+    if (cadence_mode == 0) {
+        // Fast Linear Temporal Blend
+        imageStore(out_interpolated_frame, pixel_coord, mix(prev_sample, curr_sample, blend_weight));
+        return;
+    }
+
+    // Motion-Compensated Interpolation
+    vec4 curr_l = texture(curr_frame, uv - vec2(texel_size.x, 0.0));
+    vec4 curr_r = texture(curr_frame, uv + vec2(texel_size.x, 0.0));
+    vec4 curr_u = texture(curr_frame, uv - vec2(0.0, texel_size.y));
+    vec4 curr_d = texture(curr_frame, uv + vec2(0.0, texel_size.y));
+
+    float lum_diff = abs(Luminance(curr_sample.rgb) - Luminance(prev_sample.rgb));
+
+    // Approximate optical gradient
+    vec2 grad_curr = vec2(
+        Luminance(curr_r.rgb) - Luminance(curr_l.rgb),
+        Luminance(curr_d.rgb) - Luminance(curr_u.rgb)
+    );
+
+    float grad_mag = length(grad_curr) + 1e-5;
+    vec2 motion_vec = clamp(-(grad_curr / grad_mag) * (lum_diff / (grad_mag + 0.08)), vec2(-4.0 * texel_size), vec2(4.0 * texel_size));
+
+    // Sample along motion trajectory
+    vec2 uv_prev = uv + motion_vec * blend_weight;
+    vec2 uv_curr = uv - motion_vec * (1.0 - blend_weight);
+
+    vec4 warped_prev = texture(prev_frame, uv_prev);
+    vec4 warped_curr = texture(curr_frame, uv_curr);
+
+    float motion_factor = smoothstep(0.02, motion_threshold, lum_diff);
+    vec4 interpolated = mix(mix(warped_prev, warped_curr, blend_weight), mix(prev_sample, curr_sample, blend_weight), 1.0 - motion_factor);
+
+    // Mali Adaptive Sharpening pass
+    if (sharpness > 0.0) {
+        vec3 n_color = (curr_l.rgb + curr_r.rgb + curr_u.rgb + curr_d.rgb) * 0.25;
+        interpolated.rgb = mix(interpolated.rgb, interpolated.rgb + (interpolated.rgb - n_color) * sharpness, 0.35);
+    }
+
+    imageStore(out_interpolated_frame, pixel_coord, interpolated);
+}
